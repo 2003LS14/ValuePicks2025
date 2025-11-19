@@ -1,0 +1,230 @@
+"""
+build_historical_from_nba.py
+
+Pulls real NBA game logs for a list of players using nba_api,
+then builds a historical_props.csv compatible with your Streamlit app.
+"""
+
+from nba_api.stats.static import players
+from nba_api.stats.endpoints import PlayerGameLog
+import pandas as pd
+import time
+import random
+from datetime import datetime
+
+# ---- 1. Configure which players + prop types you care about ----
+
+PLAYER_CONFIG = [
+    # name,         prop_type(s)
+    ("Stephen Curry", ["points"]),
+    ("Jonathan Kuminga", ["points"]),
+    ("Draymond Green", ["assists"]),
+    ("Brandin Podziemski", ["three_pointers_made"]),
+    ("Paolo Banchero", ["points"]),
+    ("Franz Wagner", ["points"]),
+    ("Wendell Carter Jr", ["rebounds"]),
+    ("Jalen Suggs", ["assists"]),
+    ("Jaylen Brown", ["points"]),
+    ("Derrick White", ["assists"]),
+    ("Payton Pritchard", ["assists"]),
+    ("Neemias Queta", ["rebounds"]),
+    ("Ziaire Williams", ["points"]),
+    ("Drake Powell", ["points"]),      # rookie – might have limited data depending on season
+    ("Danny Wolf", ["rebounds"]),      # same note as above
+    ("Jalen Wilson", ["three_pointers_made"]),
+    ("Cade Cunningham", ["points"]),
+    ("Jalen Duren", ["rebounds"]),
+    ("Duncan Robinson", ["three_pointers_made"]),
+    ("Isaiah Stewart", ["rebounds"]),
+    ("Trae Young", ["points"]),
+    ("Kristaps Porzingis", ["points"]),
+    ("Jalen Johnson", ["rebounds"]),
+    ("Onyeka Okongwu", ["rebounds"]),
+]
+
+SEASON = "2024-25"   # adjust if needed, format 'YYYY-YY'
+
+# ---- 2. Helper: get player ID from name ----
+
+def get_player_id(full_name: str):
+    matches = players.find_players_by_full_name(full_name)
+    if not matches:
+        print(f"WARNING: no player ID found for {full_name}")
+        return None
+    # Take best match (first)
+    return matches[0]["id"]
+
+# ---- 3. Fetch game logs for all players ----
+
+def fetch_game_logs():
+    rows = []
+    for full_name, prop_types in PLAYER_CONFIG:
+        pid = get_player_id(full_name)
+        if pid is None:
+            continue
+
+        print(f"Fetching logs for {full_name} (ID {pid})...")
+        # NBA API sometimes rate-limits; small sleep helps
+        time.sleep(0.6)
+
+        try:
+            gl = PlayerGameLog(player_id=pid, season=SEASON, season_type_all_star="Regular Season")
+            df_logs = gl.get_data_frames()[0]
+        except Exception as e:
+            print(f"Error fetching logs for {full_name}: {e}")
+            continue
+
+        # Normalize column names
+        df_logs["PLAYER_NAME"] = full_name
+        rows.append(df_logs)
+
+    if not rows:
+        return pd.DataFrame()
+
+    all_logs = pd.concat(rows, ignore_index=True)
+    return all_logs
+
+# ---- 4. Transform logs into prop-style historical dataset ----
+
+def build_historical_props(logs: pd.DataFrame) -> pd.DataFrame:
+    # Minimal columns we care about from logs
+    # G (game ID), GAME_DATE, MATCHUP, MIN, PTS, REB, AST, FG3M
+    logs = logs.copy()
+    logs["GAME_DATE"] = pd.to_datetime(logs["GAME_DATE"])
+    logs.sort_values(["PLAYER_NAME", "GAME_DATE"], inplace=True)
+
+    # Extract home/away, team, opponent from MATCHUP string like "GSW @ ORL" or "GSW vs ORL"
+    def parse_matchup(m):
+        try:
+            team, rest = m.split(" ")
+            vs_at, opp = rest.split(" ")
+            home = 1 if vs_at == "vs." else 0  # "vs."=home, "@"=away
+            return team, opp, home
+        except Exception:
+            return None, None, None
+
+    logs[["TEAM", "OPP", "HOME"]] = logs["MATCHUP"].apply(
+        lambda m: pd.Series(parse_matchup(m))
+    )
+
+    # Rename for convenience
+    logs.rename(columns={
+        "MIN": "MINUTES",
+        "PTS": "POINTS",
+        "REB": "REB",
+        "AST": "AST",
+        "FG3M": "THREES",
+    }, inplace=True)
+
+    # We'll create separate rows per prop_type (points, rebounds, etc.)
+    prop_rows = []
+
+    # Loop by player
+    for (player, group) in logs.groupby("PLAYER_NAME"):
+        group = group.sort_values("GAME_DATE").reset_index(drop=True)
+        n = len(group)
+        if n < 6:
+            # Not enough games for rolling 5-game averages
+            continue
+
+        # Rolling stats for last 5 games (shifted so they don't include current game)
+        group["POINTS_AVG5"] = group["POINTS"].rolling(5).mean().shift(1)
+        group["POINTS_STD5"] = group["POINTS"].rolling(5).std().shift(1)
+        group["REB_AVG5"] = group["REB"].rolling(5).mean().shift(1)
+        group["REB_STD5"] = group["REB"].rolling(5).std().shift(1)
+        group["AST_AVG5"] = group["AST"].rolling(5).mean().shift(1)
+        group["AST_STD5"] = group["AST"].rolling(5).std().shift(1)
+        group["THREES_AVG5"] = group["THREES"].rolling(5).mean().shift(1)
+        group["THREES_STD5"] = group["THREES"].rolling(5).std().shift(1)
+        group["MIN_AVG5"] = group["MINUTES"].rolling(5).mean().shift(1)
+
+        # Drop first 5 games (no rolling history)
+        group = group.iloc[5:].reset_index(drop=True)
+
+        for idx, row in group.iterrows():
+            # For each configured prop_type for this player
+            for full_name, prop_types in PLAYER_CONFIG:
+                if full_name != player:
+                    continue
+                for ptype in prop_types:
+                    if ptype == "points":
+                        outcome = row["POINTS"]
+                        avg5 = row["POINTS_AVG5"]
+                        std5 = row["POINTS_STD5"]
+                    elif ptype == "rebounds":
+                        outcome = row["REB"]
+                        avg5 = row["REB_AVG5"]
+                        std5 = row["REB_STD5"]
+                    elif ptype == "assists":
+                        outcome = row["AST"]
+                        avg5 = row["AST_AVG5"]
+                        std5 = row["AST_STD5"]
+                    elif ptype == "three_pointers_made":
+                        outcome = row["THREES"]
+                        avg5 = row["THREES_AVG5"]
+                        std5 = row["THREES_STD5"]
+                    else:
+                        continue
+
+                    # Skip rows where rolling stats are NaN (shouldn't happen after drop)
+                    if pd.isna(avg5) or pd.isna(std5):
+                        continue
+
+                    # --- Build synthetic prop line based on rolling avg ---
+                    # Example: line = avg5 +/- small random tweak
+                    line = float(avg5 + random.uniform(-0.8, 0.8))
+
+                    # Fake odds based on how "tight" the line is (you can replace later with real odds)
+                    american_odds = random.choice([-120, -115, -110, -105, 100, 105, 110])
+                    if american_odds < 0:
+                        implied_prob = (-american_odds) / ((-american_odds) + 100)
+                    else:
+                        implied_prob = 100 / (american_odds + 100)
+
+                    hit = 1 if outcome > line else 0
+
+                    # Very rough placeholders for opponent defense + pace
+                    # (later you can plug real team defensive metrics here)
+                    opp_def_rank = random.randint(1, 30)
+                    opp_pace = random.uniform(97, 103)
+
+                    rest_days = 1  # simple assumption (can be improved by looking at previous game date)
+
+                    prop_rows.append({
+                        "date": row["GAME_DATE"].strftime("%Y-%m-%d"),
+                        "sport": "NBA",
+                        "player": player,
+                        "team": row["TEAM"],
+                        "opponent": row["OPP"],
+                        "home": int(row["HOME"]) if row["HOME"] in [0, 1] else 1,
+                        "prop_type": ptype,
+                        "line": round(line, 1),
+                        "player_avg_last5": round(float(avg5), 2),
+                        "player_std_last5": round(float(std5), 2),
+                        "minutes_avg_last5": round(float(row["MIN_AVG5"]), 1),
+                        "opp_def_rank": opp_def_rank,
+                        "opp_pace": round(opp_pace, 1),
+                        "rest_days": rest_days,
+                        "american_odds": american_odds,
+                        "implied_prob": implied_prob,
+                        "outcome": float(outcome),
+                        "hit": int(hit),
+                    })
+
+    props_df = pd.DataFrame(prop_rows)
+    return props_df
+
+def main():
+    logs = fetch_game_logs()
+    if logs.empty:
+        print("No logs fetched – check player names/season.")
+        return
+
+    hist = build_historical_props(logs)
+    print(f"Built {len(hist)} historical prop rows.")
+
+    hist.to_csv("historical_props_real_nba.csv", index=False)
+    print("Saved to historical_props_real_nba.csv")
+
+if __name__ == "__main__":
+    main()
